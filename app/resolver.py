@@ -1,0 +1,393 @@
+"""确定性回溯依赖求解器。
+
+规则：
+* 同一个包（PEP 503 规范化名）全局只能选定一个版本；
+* 候选版本严格按 PEP 440 从高到低尝试；
+* 对每个包，沿所有传递路径收集到的全部约束必须同时满足；
+* 新约束与已选版本冲突、或交集下没有候选时，沿选择点回溯尝试更低版本；
+* 已选定的包再次被要求（含依赖环、菱形依赖）时不重复展开，只校验约束；
+* 结果与冲突报告均按名称/版本排序，不依赖输入字典顺序。
+
+冲突报告通过 chosen_for（每个包由哪一条需求首次触发展开）重建
+“根需求 → …… → 冲突包”的约束来源链。
+"""
+
+from __future__ import annotations
+
+import sys
+from dataclasses import dataclass, field
+
+from packaging.specifiers import SpecifierSet
+from packaging.version import Version
+
+from .repository import Candidate, Repository, canonical
+
+# 尝试候选版本的总次数上限，防止恶意快照造成指数级搜索。
+DEFAULT_ATTEMPT_LIMIT = 100_000
+
+# 依赖链深度护栏：超过该深度视为快照异常，返回 409 而非崩溃。
+DEFAULT_DEPTH_LIMIT = 5_000
+
+# 求解器是递归下降的（每展开一个未决包下沉一层），把解释器栈抬高，
+# 让 DEFAULT_DEPTH_LIMIT 以内的链都能处理。
+sys.setrecursionlimit(max(sys.getrecursionlimit(), DEFAULT_DEPTH_LIMIT + 1_000))
+
+_ROOT = "root"  # 根请求在来源链 / 依赖边中的虚拟声明方
+
+
+class ResolutionLimit(RuntimeError):
+    """搜索超过尝试次数上限。"""
+
+
+# _solve 的返回哨兵：None=约束冲突（正常回溯失败），_LIMIT=超过尝试上限。
+_LIMIT_SENTINEL: object = object()
+
+
+@dataclass(frozen=True)
+class Requirement:
+    """一条施加在 subject 上的约束及其来源边。"""
+
+    subject: str
+    spec: SpecifierSet
+    raw_spec: str
+    # 来源：(声明方包名, 声明方版本)；根需求为 None。
+    origin: tuple[str, str] | None
+    # 声明方依赖列表中的序号（稳定排序用）。
+    order: int
+
+
+@dataclass
+class State:
+    """一次分支中的求解状态；回溯通过对每次尝试拷贝状态实现。
+
+    clone() 采用浅拷贝：可变容器（dict / 各约束列表 / 边集合）只在
+    本层真正修改时才复制（写时复制），使深依赖链下的回溯保持线性成本。
+    """
+
+    # 已折叠（已选定）包的全部需求，按折叠顺序排列。
+    constraints: dict[str, list[Requirement]] = field(default_factory=dict)
+    selection: dict[str, Version] = field(default_factory=dict)
+    # 每个包是被哪一条需求首次触发展开的（来源链回溯用）。
+    chosen_for: dict[str, Requirement] = field(default_factory=dict)
+    # 依赖边：(声明方包, 声明方版本, 被依赖包, 原始约束)
+    edges: set[tuple[str, str, str, str]] = field(default_factory=set)
+
+    def clone(self) -> State:
+        # 浅拷贝即可：本层只会 (a) 给 dict 增加新键，或
+        # (b) 通过 _replace_constraints / 复制后的 edges 集合修改既有值。
+        return State(
+            constraints=dict(self.constraints),
+            selection=dict(self.selection),
+            chosen_for=dict(self.chosen_for),
+            edges=self.edges,  # 占位；首次 add 前必须先 copy（见 add_edge）
+        )
+
+    def add_edge(self, edge: tuple[str, str, str, str]) -> None:
+        # 写时复制：与父分支共享的 set 在首次写入时复制。
+        self.edges = self.edges | {edge}
+
+    def append_constraint(self, subject: str, reqs: list[Requirement]) -> None:
+        """折叠（覆盖）某包的约束列表（新列表，不影响共享的旧列表）。"""
+        self.constraints[subject] = reqs
+
+
+@dataclass(frozen=True)
+class ChainLink:
+    """来源链上的一跳。"""
+
+    package: str | None  # None 表示根请求
+    version: str | None
+    requires: str  # 该跳施加的原始约束文本
+
+
+@dataclass(frozen=True)
+class ConflictReport:
+    subject: str
+    kind: str  # "incompatible" | "no_candidates"
+    message: str
+    chains: tuple[tuple[ChainLink, ...], ...]
+    partial_selection: dict[str, str]
+
+
+def _combined_spec(reqs: list[Requirement]) -> SpecifierSet:
+    spec = SpecifierSet()
+    for r in reqs:
+        spec &= r.spec
+    return spec
+
+
+def _req_sort_key(r: Requirement) -> tuple:
+    # 根需求恒在最前；其后按声明方、版本、声明序号、约束文本排序。
+    if r.origin is None:
+        return (0, "", "", -1, r.raw_spec)
+    return (1, r.origin[0], r.origin[1], r.order, r.raw_spec)
+
+
+def _chain_for(req: Requirement | None, state: State) -> tuple[ChainLink, ...]:
+    """沿 chosen_for 重建一条需求的来源链：根请求 → …… → 该需求。"""
+    links: list[ChainLink] = []
+    seen: set[str] = set()
+    cur: Requirement | None = req
+    while cur is not None:
+        if cur.subject in seen:  # 环保护（来源链本应是树）
+            break
+        seen.add(cur.subject)
+        if cur.origin is None:
+            links.append(ChainLink(None, None, cur.raw_spec))
+            cur = None
+        else:
+            links.append(ChainLink(cur.origin[0], cur.origin[1], cur.raw_spec))
+            cur = state.chosen_for.get(cur.origin[0])
+    links.reverse()
+    return tuple(links)
+
+
+def _chain_key(chain: tuple[ChainLink, ...]) -> tuple:
+    return tuple(
+        (link.package or "", link.version or "", link.requires) for link in chain
+    )
+
+
+class Resolver:
+    def __init__(
+        self,
+        repository: Repository,
+        *,
+        allow_prereleases: bool = False,
+        attempt_limit: int = DEFAULT_ATTEMPT_LIMIT,
+        depth_limit: int = DEFAULT_DEPTH_LIMIT,
+    ):
+        self.repo = repository
+        self.allow_prereleases = allow_prereleases
+        self.attempt_limit = attempt_limit
+        self.depth_limit = depth_limit
+        self.attempts = 0
+        self.max_depth = 0
+        # subject -> 跨失败分支累积的去重来源链。
+        self._collected: dict[str, set[tuple[ChainLink, ...]]] = {}
+        self._kind: dict[str, str] = {}
+        self._message: dict[str, str] = {}
+        self._snapshot: dict[str, str] = {}
+
+    # ------------------------------------------------------------------ #
+    # 版本匹配
+    # ------------------------------------------------------------------ #
+    def _version_satisfies(self, version: Version, spec: SpecifierSet) -> bool:
+        if self.allow_prereleases:
+            return version in spec
+        # pip 跟随语义：默认排除预发布（dev/a/b/rc），除非约束谓词里显式
+        # 提到了预发布版本（如 ==1.0a1，此时该谓词 prereleases=True）。
+        if version.is_prerelease or version.is_devrelease:
+            if not any(s.prereleases for s in spec):
+                return False
+        return version in spec
+
+    def _eligible(self, subject: str, spec: SpecifierSet) -> list[Candidate]:
+        # 仓库候选已按版本降序排列，过滤后顺序不变。
+        return [
+            cand
+            for cand in self.repo.candidates(subject)
+            if self._version_satisfies(cand.version, spec)
+        ]
+
+    # ------------------------------------------------------------------ #
+    # 冲突记录
+    # ------------------------------------------------------------------ #
+    def _record(
+        self,
+        subject: str,
+        kind: str,
+        message: str,
+        reqs: list[Requirement],
+        state: State,
+    ) -> None:
+        bucket = self._collected.setdefault(subject, set())
+        bucket.update(_chain_for(r, state) for r in reqs)
+        self._kind[subject] = kind
+        self._message[subject] = message
+        if not self._snapshot:
+            self._snapshot = {
+                pkg: str(ver) for pkg, ver in sorted(state.selection.items())
+            }
+
+    def _no_candidate_message(
+        self, subject: str, combined: SpecifierSet
+    ) -> str:
+        spec_text = str(combined) or "（无约束）"
+        if not self.repo.known(subject):
+            return f"包 {subject} 不在仓库快照中，但约束要求 {spec_text}"
+        available = ", ".join(str(c.version) for c in self.repo.candidates(subject))
+        return (
+            f"包 {subject} 在约束交集 {spec_text} 下没有可满足的版本；"
+            f"快照中的版本（降序）：{available or '无'}"
+        )
+
+    # ------------------------------------------------------------------ #
+    # 入口
+    # ------------------------------------------------------------------ #
+    def resolve(
+        self, root_name: str, root_spec: SpecifierSet, root_raw: str
+    ) -> State | None:
+        """成功返回最终 State；约束无解返回 None；超上限抛 ResolutionLimit。"""
+        root_name = canonical(root_name)
+        root_req = Requirement(root_name, root_spec, root_raw.strip() or "*", None, 0)
+        state = State()
+        result = self._solve(state, [root_req], depth=0)
+        if result is _LIMIT_SENTINEL:
+            if self.max_depth > self.depth_limit:
+                raise ResolutionLimit(
+                    f"依赖链深度超过上限（{self.depth_limit}）"
+                )
+            raise ResolutionLimit("搜索超过尝试次数上限")
+        return result  # type: ignore[return-value]
+
+    # ------------------------------------------------------------------ #
+    # 递归主体
+    # ------------------------------------------------------------------ #
+    def _solve(
+        self, in_state: State, pending: list[Requirement], *, depth: int
+    ) -> State | object:
+        # 先克隆：本层的约束折叠 / 选边都发生在私有状态上，
+        # 这样候选分支全部失败时不会污染父分支（回溯正确性）。
+        state = in_state.clone()
+        self.max_depth = max(self.max_depth, depth)
+        if depth > self.depth_limit:
+            return _LIMIT_SENTINEL
+
+        # --- 第一步：把待处理需求按包归组 ------------------------------
+        groups: dict[str, list[Requirement]] = {}
+        for r in sorted(pending, key=_req_sort_key):
+            groups.setdefault(r.subject, []).append(r)
+
+        # --- 第二步：已选定的包（依赖环 / 菱形）只校验，绝不重新展开 ----
+        for subject in sorted(groups):
+            if subject not in state.selection:
+                continue
+            new_reqs = groups.pop(subject)
+            reqs = state.constraints[subject] + new_reqs
+            combined = _combined_spec(reqs)
+            selected = state.selection[subject]
+            for r in new_reqs:
+                if r.origin is not None:
+                    state.add_edge(
+                        (r.origin[0], r.origin[1], subject, r.raw_spec)
+                    )
+            if not self._version_satisfies(selected, combined):
+                self._record(
+                    subject,
+                    "incompatible",
+                    f"已选 {subject}=={selected} 与约束交集 {combined or '（无约束）'} 不兼容",
+                    reqs,
+                    state,
+                )
+                return None
+            state.append_constraint(subject, reqs)
+
+        if not groups:
+            return state  # 所有需求都已落在已选包上且全部满足
+
+        # --- 第三步：MRV——可满足候选最少的包先展开（名称次序兜底） -----
+        def mrv_key(name: str) -> tuple[int, str]:
+            combined = _combined_spec(groups[name])
+            return (len(self._eligible(name, combined)), name)
+
+        chosen = min(groups, key=mrv_key)
+        chosen_reqs = sorted(groups.pop(chosen), key=_req_sort_key)
+        combined = _combined_spec(chosen_reqs)
+        eligible = self._eligible(chosen, combined)
+
+        # 折叠约束、来源边与触发需求。
+        state.append_constraint(chosen, chosen_reqs)
+        for r in chosen_reqs:
+            if r.origin is not None:
+                state.add_edge(
+                    (r.origin[0], r.origin[1], chosen, r.raw_spec)
+                )
+        state.chosen_for[chosen] = min(
+            chosen_reqs, key=lambda r: (len(_chain_for(r, state)), _chain_key(_chain_for(r, state)))
+        )
+
+        if not eligible:
+            self._record(
+                chosen,
+                "no_candidates",
+                self._no_candidate_message(chosen, combined),
+                chosen_reqs,
+                state,
+            )
+            return None
+
+        # 其余未决需求原样带入每个候选分支。
+        rest = [r for reqs in groups.values() for r in reqs]
+
+        # --- 第四步：候选版本从高到低，逐版本克隆分支尝试 --------------
+        for cand in eligible:
+            self.attempts += 1
+            if self.attempts > self.attempt_limit:
+                return _LIMIT_SENTINEL
+
+            branch = state.clone()
+            branch.selection[chosen] = cand.version
+
+            introduced = [
+                Requirement(
+                    dep.name,
+                    dep.spec,
+                    dep.raw_spec,
+                    (chosen, str(cand.version)),
+                    order,
+                )
+                for order, dep in enumerate(cand.deps)
+            ]
+            result = self._solve(branch, introduced + rest, depth=depth + 1)
+            if result is _LIMIT_SENTINEL:
+                return _LIMIT_SENTINEL
+            if result is not None:
+                return result
+        return None
+
+    # ------------------------------------------------------------------ #
+    # 输出
+    # ------------------------------------------------------------------ #
+    def build_output(self, state: State, root_name: str) -> dict:
+        root_name = canonical(root_name)
+        locked = {pkg: str(ver) for pkg, ver in sorted(state.selection.items())}
+
+        edge_out = [
+            {"from": f"{pkg}=={ver}", "to": dep, "specifier": raw}
+            for pkg, ver, dep, raw in sorted(state.edges)
+        ]
+        # 根请求 -> 根包的边放在最前。
+        root_spec = state.constraints[root_name][0].raw_spec
+        edge_out = [{"from": _ROOT, "to": root_name, "specifier": root_spec}] + edge_out
+
+        return {
+            "status": "ok",
+            "root": root_name,
+            "root_version": str(state.selection[root_name]),
+            "locked": locked,
+            "edges": edge_out,
+        }
+
+    def build_conflicts(self, *, limit: bool = False) -> dict:
+        conflicts = [
+            ConflictReport(
+                subject=subject,
+                kind=self._kind[subject],
+                message=self._message[subject],
+                chains=tuple(sorted(self._collected[subject], key=_chain_key)),
+                partial_selection=dict(self._snapshot),
+            )
+            for subject in sorted(self._collected)
+        ]
+        if limit:
+            status = "limit"
+            message = (
+                f"解析在尝试 {self.attempts} 个候选版本后超过上限；"
+                "以下为搜索过程中记录的冲突点"
+            )
+        else:
+            status = "conflict"
+            subjects = "、".join(c.subject for c in conflicts) or "未知"
+            message = f"依赖约束无解，冲突包：{subjects}"
+        return {"status": status, "message": message, "_conflicts": conflicts}
