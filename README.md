@@ -4,6 +4,8 @@
 [`packaging`](https://packaging.pypa.io/) 实现 PEP 440（版本/约束）、
 PEP 503（包名规范化）与 **PEP 508（环境标记 marker）**，通过带回溯的
 搜索生成**确定性锁定清单**；无解时返回从根需求到冲突包的**约束来源链**。
+`/upgrade` 在现有锁定清单（`current_lock`）上升级单个目标包：取能完成
+整体解析的最高版本，并最小化其余包相对当前锁的变更数量。
 
 - **无远程访问**：不访问 PyPI 或任何索引，不做磁盘缓存，全部数据在请求内存中处理。
 - **目标环境随请求给定**：每条依赖可携带 PEP 508 marker，由请求必填的
@@ -12,6 +14,9 @@ PEP 503（包名规范化）与 **PEP 508（环境标记 marker）**，通过带
 - **仅激活依赖参与求解**：marker 为假的依赖不进入全局约束、回溯、冲突来源链与 `edges`。
 - **全局唯一版本**：同一包（PEP 503 规范化后）在整棵依赖树中只能选定一个版本。
 - **高版本优先**：候选版本严格按 PEP 440 从高到低尝试，失败即回溯到更低版本。
+- **最小变更升级**：`/upgrade` 只考虑严格高于当前版本的目标候选，取能完成
+  整体解析的最高版本；该版本下在所有有效解中优先选择非目标包相对
+  `current_lock` 新增/删除/版本变化数量最少的解。
 - **环安全**：依赖环（含自环、菱形依赖）不会导致重复展开；环上的新约束仍会校验。
 - **确定性**：结果只取决于快照内容与目标环境，与包键顺序、候选列表顺序无关。
 
@@ -29,6 +34,7 @@ docker compose up --build
 | --- | --- |
 | API 根地址 | `http://localhost:8000` |
 | 解析接口 | `POST http://localhost:8000/resolve` |
+| 升级接口 | `POST http://localhost:8000/upgrade` |
 | 健康检查 | `GET  http://localhost:8000/healthz` |
 | 交互文档（Swagger） | `http://localhost:8000/docs` |
 | OpenAPI Schema | `http://localhost:8000/openapi.json` |
@@ -263,6 +269,71 @@ curl -s -X POST http://localhost:8000/resolve \
 
 `GET /healthz` 返回 `{"status":"ok"}`。
 
+### `POST /upgrade`
+
+在现有锁定清单上升级**单个目标包**。请求体包含 `/resolve` 的全部字段
+（`repository` / `root` / `target_environment` / `specifier` /
+`allow_prereleases`，语义完全一致），并附加两个字段：
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `current_lock` | `object` | 是 | 当前锁定清单：`{包名: 版本}`；包名按 PEP 503 规范化匹配，版本须为合法 PEP 440。仅作为最小化变更的参照，不参与约束求解 |
+| `target` | `string` | 是 | 要升级的包名；**必须存在于 `current_lock` 中**，否则返回 422 |
+
+升级规则：
+
+1. 只考虑 `target` **严格高于** `current_lock[target]` 的候选版本
+   （预发布版本遵循 `allow_prereleases`，与 `/resolve` 相同）；
+2. 从高到低尝试候选：以根级 `==版本` 约束钉住目标包后做整体解析，
+   **第一个存在可行解的候选即为目标版本**；所有更高候选均无解
+   （或根本没有更高版本）时返回 **409**；
+3. 目标版本确定后，在该版本的**所有有效解**中，优先选择非目标包相对
+   `current_lock` 的**新增 + 删除 + 版本变化数量最少**的解；数量相同时
+   沿用 `/resolve` 的确定性版本顺序（高版本优先）；
+4. `current_lock` 不约束求解：未出现在新锁定清单中的包记为删除，
+   新引入的包记为新增，版本按 PEP 440 比较（`1.0` 与 `1.0.0` 相等，
+   不产生变更项）。
+
+```bash
+curl -s -X POST http://localhost:8000/upgrade \
+  -H 'Content-Type: application/json' \
+  -d @examples/upgrade.json
+```
+
+示例中 `web-framework` 当前锁定 `2.4.0`：候选 `3.1.0` 要求
+`shared-util==2.0.0`，与 `auth-lib` 的 `<2.0` 冲突而被跳过；`3.2.0`
+是可行的最高目标版本，且 `shared-util` 保持 `current_lock` 中的
+`1.5.0`（变更数最少）：
+
+```json
+{
+  "status": "ok",
+  "root": "app",
+  "root_version": "1.0.0",
+  "locked": {
+    "app": "1.0.0",
+    "auth-lib": "0.9.0",
+    "shared-util": "1.5.0",
+    "web-framework": "3.2.0"
+  },
+  "changes": [
+    {"name": "web-framework", "from": "2.4.0", "to": "3.2.0"}
+  ]
+}
+```
+
+- `locked`：升级后的**完整**锁定清单（按规范化包名排序）。
+- `changes`：相对 `current_lock` 的全部变化（含目标包），**按包名排序**；
+  `from` 为 `null` 表示新增包，`to` 为 `null` 表示被删除的包。
+
+`/upgrade` 的状态码：
+
+| 状态码 | 含义 |
+| --- | --- |
+| `200` | 升级成功，返回完整 `locked` 与 `changes` |
+| `409` | 无可行升级（没有严格更高的候选，或所有更高候选都无法完成整体解析，`status: "conflict"` 并附冲突来源链）；或搜索超过内置尝试上限（`status: "limit"`） |
+| `422` | 请求/快照非法（同 `/resolve`），或 `target` 不存在于 `current_lock` 中、`current_lock` 含非法 PEP 440 版本 |
+
 ---
 
 ## 三、解析规则说明
@@ -282,6 +353,11 @@ curl -s -X POST http://localhost:8000/resolve \
 7. **预发布**：默认排除 `a/b/rc/dev`；`allow_prereleases=true` 放开；
    或约束显式钉住预发布（如 `==2.0rc1`）时也会被接受。
 8. **确定性**：候选按 PEP 440 降序、输出按键排序，重复解析同一快照与环境结果逐字节一致。
+9. **升级（`/upgrade`）**：在 `/resolve` 语义上附加 `current_lock` 与 `target`。
+   目标包只尝试严格高于当前版本的候选（高版本优先），取第一个能完成整体
+   解析的版本；随后在该版本的所有有效解中枚举并保留“非目标包相对
+   `current_lock` 变化数量最少”的解（分支定界剪枝，变化数相同按既定
+   确定性顺序取先遇到者）。`/resolve` 的行为不受任何影响。
 
 ### 安全护栏
 
@@ -298,7 +374,7 @@ app/
   repository.py  # 快照规范化、PEP 440/503 解析、按环境过滤 marker
   markers.py     # PEP 508 marker 解析/白名单校验/环境求值（不读宿主机）
   schemas.py     # 请求/响应模型
-examples/        # curl 示例请求体（含跨环境 marker 示例）
+examples/        # curl 示例请求体（含跨环境 marker 与 /upgrade 示例）
 tests/           # 求解器与 HTTP 层测试（pytest + FastAPI TestClient）
 Dockerfile
 docker-compose.yml

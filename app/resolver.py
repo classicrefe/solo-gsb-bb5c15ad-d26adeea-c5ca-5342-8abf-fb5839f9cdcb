@@ -10,6 +10,16 @@
 
 冲突报告通过 chosen_for（每个包由哪一条需求首次触发展开）重建
 “根需求 → …… → 冲突包”的约束来源链。
+
+升级模式（POST /upgrade 使用，见 upgrade()）：
+* 逐一枚举严格高于当前版本的目标候选（降序），钉住 ``==版本`` 后整体求解，
+  第一个存在可行解的候选即为升级目标版本；
+* 对确定的钉版本，求解器不再返回首个解，而是按既定确定性顺序枚举全部解，
+  保留“非目标包相对 current_lock 的新增/删除/版本变化数量”最少的解；
+  数量相同时，枚举顺序保证先遇到的（即普通模式会选中的）解胜出；
+* 枚举按分支定界剪枝：已选包中已与 current_lock 不同的数量是最终成本的
+  下界（选择集沿分支只增不减），下界不优于当前最优即剪枝；
+* 普通 /resolve 路径不进入优化模式，行为与性能特征完全不变。
 """
 
 from __future__ import annotations
@@ -168,6 +178,12 @@ class Resolver:
         self._kind: dict[str, str] = {}
         self._message: dict[str, str] = {}
         self._snapshot: dict[str, str] = {}
+        # 升级优化模式：_opt_reference 非 None 时枚举全部解，
+        # 保留相对 reference（current_lock）变化最少的解（见 resolve_optimal）。
+        self._opt_reference: dict[str, Version] | None = None
+        self._opt_target: str | None = None
+        self._best_state: State | None = None
+        self._best_cost: float = float("inf")
 
     # ------------------------------------------------------------------ #
     # 版本匹配
@@ -226,20 +242,141 @@ class Resolver:
     # 入口
     # ------------------------------------------------------------------ #
     def resolve(
-        self, root_name: str, root_spec: SpecifierSet, root_raw: str
+        self,
+        root_name: str,
+        root_spec: SpecifierSet,
+        root_raw: str,
+        extra_requirements: list[Requirement] | None = None,
     ) -> State | None:
-        """成功返回最终 State；约束无解返回 None；超上限抛 ResolutionLimit。"""
+        """成功返回最终 State；约束无解返回 None；超上限抛 ResolutionLimit。
+
+        ``extra_requirements`` 是与根需求并列的额外根级约束（升级模式用来
+        钉住目标包版本）；普通 /resolve 不传，行为不变。优化模式下返回的
+        是相对 reference 变化最少的解（见 resolve_optimal）。
+        """
         root_name = canonical(root_name)
         root_req = Requirement(root_name, root_spec, root_raw.strip() or "*", None, 0)
         state = State()
-        result = self._solve(state, [root_req], depth=0)
+        result = self._solve(state, [root_req, *(extra_requirements or ())], depth=0)
         if result is _LIMIT_SENTINEL:
             if self.max_depth > self.depth_limit:
                 raise ResolutionLimit(
                     f"依赖链深度超过上限（{self.depth_limit}）"
                 )
             raise ResolutionLimit("搜索超过尝试次数上限")
+        if self._opt_reference is not None:
+            # 优化模式下 _solve 枚举全部解后恒返回 None，最优解在 _best_state。
+            return self._best_state
         return result  # type: ignore[return-value]
+
+    # ------------------------------------------------------------------ #
+    # 升级（POST /upgrade）
+    # ------------------------------------------------------------------ #
+    def higher_candidates(
+        self, target: str, current_version: Version
+    ) -> list[Candidate]:
+        """严格高于 current_version 的候选（遵循预发布开关），按版本降序。"""
+        higher = []
+        for cand in self.repo.candidates(target):
+            if cand.version <= current_version:
+                continue
+            if not self.allow_prereleases and (
+                cand.version.is_prerelease or cand.version.is_devrelease
+            ):
+                continue
+            higher.append(cand)
+        return higher
+
+    def upgrade(
+        self,
+        root_name: str,
+        root_spec: SpecifierSet,
+        root_raw: str,
+        *,
+        target: str,
+        current_version: Version,
+        reference: dict[str, Version],
+    ) -> State | None:
+        """在整体可解析的前提下把 target 升到尽可能高的版本。
+
+        仅考虑严格高于 current_version 的候选（降序尝试）；对每个候选以
+        根级 ``==版本`` 约束钉住后整体求解，第一个存在可行解的候选即为
+        目标版本。对该版本枚举全部解，返回非目标包相对 reference
+        （current_lock）变化最少的解；数量相同按既定确定性顺序取先遇到者。
+        所有更高候选均无解时返回 None；超上限抛 ResolutionLimit。
+        """
+        target = canonical(target)
+        for cand in self.higher_candidates(target, current_version):
+            pin = Requirement(
+                target,
+                SpecifierSet(f"=={cand.version}"),
+                f"=={cand.version}",
+                None,
+                0,
+            )
+            state = self.resolve_optimal(
+                root_name,
+                root_spec,
+                root_raw,
+                pin=pin,
+                reference=reference,
+                target=target,
+            )
+            if state is not None:
+                return state
+        return None
+
+    def resolve_optimal(
+        self,
+        root_name: str,
+        root_spec: SpecifierSet,
+        root_raw: str,
+        *,
+        pin: Requirement,
+        reference: dict[str, Version],
+        target: str,
+    ) -> State | None:
+        """在 pin 约束下枚举全部解，返回相对 reference 变化最少的状态。"""
+        self._opt_reference = reference
+        self._opt_target = canonical(target)
+        self._best_state = None
+        self._best_cost = float("inf")
+        try:
+            return self.resolve(
+                root_name, root_spec, root_raw, extra_requirements=[pin]
+            )
+        finally:
+            self._opt_reference = None
+            self._opt_target = None
+            self._best_state = None
+            self._best_cost = float("inf")
+
+    # ------------------------------------------------------------------ #
+    # 升级成本（非目标包相对 current_lock 的变化数）
+    # ------------------------------------------------------------------ #
+    def _lower_bound(self, state: State) -> int:
+        """已选包中已与 reference 不同的数量（最终成本的单调下界）。"""
+        assert self._opt_reference is not None
+        ref = self._opt_reference
+        target = self._opt_target
+        return sum(
+            1
+            for pkg, ver in state.selection.items()
+            if pkg != target and ref.get(pkg) != ver
+        )
+
+    def _change_cost(self, state: State) -> int:
+        """完整解的成本：新增 + 删除 + 版本变化的非目标包数量。"""
+        assert self._opt_reference is not None
+        ref = self._opt_reference
+        target = self._opt_target
+        cost = self._lower_bound(state)  # 新增或版本变化的已选包
+        cost += sum(
+            1
+            for pkg in ref
+            if pkg != target and pkg not in state.selection  # 被删除的包
+        )
+        return cost
 
     # ------------------------------------------------------------------ #
     # 递归主体
@@ -284,7 +421,14 @@ class Resolver:
             state.append_constraint(subject, reqs)
 
         if not groups:
-            return state  # 所有需求都已落在已选包上且全部满足
+            if self._opt_reference is None:
+                return state  # 所有需求都已落在已选包上且全部满足
+            # 优化模式：记录最优解后返回 None，让父层继续枚举其余分支。
+            cost = self._change_cost(state)
+            if cost < self._best_cost:
+                self._best_cost = cost
+                self._best_state = state
+            return None
 
         # --- 第三步：MRV——可满足候选最少的包先展开（名称次序兜底） -----
         def mrv_key(name: str) -> tuple[int, str]:
@@ -328,6 +472,13 @@ class Resolver:
 
             branch = state.clone()
             branch.selection[chosen] = cand.version
+
+            # 优化模式剪枝：选择集沿分支只增不减，下界不劣于当前最优即跳过。
+            if (
+                self._opt_reference is not None
+                and self._lower_bound(branch) >= self._best_cost
+            ):
+                continue
 
             introduced = [
                 Requirement(

@@ -108,6 +108,26 @@ class ResolveRequest(BaseModel):
     )
 
 
+class UpgradeRequest(ResolveRequest):
+    """POST /upgrade 的请求体：在 /resolve 全部字段上附加当前锁定清单与升级目标。"""
+
+    model_config = {"extra": "forbid"}
+
+    current_lock: dict[str, str] = Field(
+        ...,
+        description=(
+            "当前锁定清单：包名（PEP 503 规范化匹配）-> PEP 440 版本；"
+            "作为最小化变更的参照，不参与约束求解。"
+        ),
+    )
+    target: str = Field(
+        ...,
+        min_length=1,
+        pattern=NAME_PATTERN,
+        description="要升级的包名；必须存在于 current_lock 中，否则返回 422。",
+    )
+
+
 # --------------------------------------------------------------------- #
 # 响应模型
 # --------------------------------------------------------------------- #
@@ -129,6 +149,38 @@ class ResolveResponse(BaseModel):
         ..., description="确定性锁定清单：规范化包名 -> 版本。"
     )
     edges: list[EdgeOut] = Field(..., description="依赖边（已排序）。")
+
+
+class ChangeOut(BaseModel):
+    """单个包相对 current_lock 的变化。"""
+
+    model_config = {"extra": "forbid", "populate_by_name": True}
+
+    name: str = Field(..., description="规范化包名。")
+    from_: str | None = Field(
+        ..., alias="from", description="current_lock 中的版本；新增包为 null。"
+    )
+    to: str | None = Field(
+        ..., description="升级后锁定清单中的版本；被删除的包为 null。"
+    )
+
+
+class UpgradeResponse(BaseModel):
+    model_config = {"extra": "forbid", "populate_by_name": True}
+
+    status: Literal["ok"]
+    root: str
+    root_version: str
+    locked: dict[str, str] = Field(
+        ..., description="升级后的完整确定性锁定清单：规范化包名 -> 版本。"
+    )
+    changes: list[ChangeOut] = Field(
+        ...,
+        description=(
+            "相对 current_lock 的全部变化（含目标包），按包名排序；"
+            "from 为 null 表示新增，to 为 null 表示删除。"
+        ),
+    )
 
 
 class ChainLinkOut(BaseModel):

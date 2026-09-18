@@ -156,3 +156,27 @@ def build_repository(
 
 def parse_root_specifier(raw: str) -> SpecifierSet:
     return _parse_specifier(raw, owner="<root request>")
+
+
+def parse_current_lock(raw: dict[str, str]) -> dict[str, Version]:
+    """校验并规范化 POST /upgrade 的 current_lock：PEP 503 包名 -> PEP 440 版本。
+
+    非法版本、或同一规范化包名对应多个不同版本时抛 SnapshotError
+    （API 层映射为 422）。
+    """
+    lock: dict[str, Version] = {}
+    for name, text in raw.items():
+        cname = canonical(name)
+        version_text = str(text).strip()
+        try:
+            version = Version(version_text)
+        except InvalidVersion as exc:
+            raise SnapshotError(
+                f"current_lock 中包 {cname!r} 的版本 {text!r} 不是合法的 PEP 440 版本"
+            ) from exc
+        if cname in lock and lock[cname] != version:
+            raise SnapshotError(
+                f"current_lock 中包 {cname!r} 出现了多个不同版本"
+            )
+        lock[cname] = version
+    return lock
