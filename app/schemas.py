@@ -108,6 +108,48 @@ class ResolveRequest(BaseModel):
     )
 
 
+class UpgradeRequest(BaseModel):
+    """POST /upgrade 的请求体：/resolve 的快照/根包/环境语义 + 现有锁定与升级目标。"""
+
+    model_config = {"extra": "forbid"}
+
+    repository: dict[str, list[CandidateIn]] = Field(
+        ...,
+        description="仓库快照，语义与 POST /resolve 完全一致。",
+    )
+    root: str = Field(
+        ...,
+        min_length=1,
+        pattern=NAME_PATTERN,
+        description="根包名称（与 /resolve 相同）；必须存在于 repository 中。",
+    )
+    target_environment: TargetEnvironmentIn = Field(
+        ...,
+        description="目标环境与 marker 语义，与 POST /resolve 完全一致。",
+    )
+    allow_prereleases: bool = Field(
+        False,
+        description="是否允许预发布版本（dev/a/b/rc）。默认关闭。",
+    )
+    current_lock: dict[str, str] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "现有的锁定清单：规范化包名 -> PEP 440 版本。升级以此为变化比较基线；"
+            "规范化后重名或存在无法按 PEP 440 解析的版本均返回 422。"
+        ),
+    )
+    target: str = Field(
+        ...,
+        min_length=1,
+        pattern=NAME_PATTERN,
+        description=(
+            "要升级的单个包（按 PEP 503 规范化匹配）；必须存在于 current_lock，"
+            "否则返回 422。"
+        ),
+    )
+
+
 # --------------------------------------------------------------------- #
 # 响应模型
 # --------------------------------------------------------------------- #
@@ -129,6 +171,39 @@ class ResolveResponse(BaseModel):
         ..., description="确定性锁定清单：规范化包名 -> 版本。"
     )
     edges: list[EdgeOut] = Field(..., description="依赖边（已排序）。")
+
+
+class ChangeOut(BaseModel):
+    """单个包相对 current_lock 的变化。"""
+
+    model_config = {"extra": "forbid"}
+
+    package: str = Field(..., description="规范化包名。")
+    from_: str | None = Field(
+        ...,
+        alias="from",
+        description="current_lock 中的版本；新增包时为 null。",
+    )
+    to: str | None = Field(
+        ...,
+        description="升级后锁定的版本；包被删除时为 null。",
+    )
+
+
+class UpgradeResponse(BaseModel):
+    model_config = {"extra": "forbid", "populate_by_name": True}
+
+    status: Literal["ok"]
+    root: str
+    root_version: str
+    target: str = Field(..., description="被升级的包（规范化名）。")
+    target_version: str = Field(..., description="升级后的目标版本。")
+    locked: dict[str, str] = Field(
+        ..., description="升级后的完整锁定清单：规范化包名 -> 版本。"
+    )
+    changes: list[ChangeOut] = Field(
+        ..., description="相对 current_lock 的变化，按包名排序。"
+    )
 
 
 class ChainLinkOut(BaseModel):

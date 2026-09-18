@@ -335,3 +335,309 @@ def test_environment_values_taken_from_request_not_host():
         repository=repo, target_environment=env))
     assert r.status_code == 200, r.text
     assert "win-only" in r.json()["locked"]
+
+
+# --------------------------------------------------------------------- #
+# POST /upgrade
+# --------------------------------------------------------------------- #
+UPGRADE_ENV = {
+    "python_version": "3.11",
+    "sys_platform": "linux",
+    "platform_machine": "x86_64",
+}
+
+
+def upgrade_body(**overrides):
+    base = {
+        "repository": {
+            "app": [{"version": "1.0",
+                     "dependencies": [{"name": "lib"}]}],
+            "lib": [
+                {"version": "2.0",
+                 "dependencies": [{"name": "util"}]},
+                {"version": "1.0",
+                 "dependencies": [{"name": "util"}]},
+            ],
+            "util": [{"version": "1.0"}],
+        },
+        "root": "app",
+        "target_environment": UPGRADE_ENV,
+        "allow_prereleases": False,
+        "current_lock": {"app": "1.0", "lib": "1.0", "util": "1.0"},
+        "target": "lib",
+    }
+    base.update(overrides)
+    return base
+
+
+def test_upgrade_basic():
+    r = client.post("/upgrade", json=upgrade_body())
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["status"] == "ok"
+    assert body["target"] == "lib"
+    assert body["target_version"] == "2.0"
+    assert body["root_version"] == "1.0"
+    assert body["locked"] == {"app": "1.0", "lib": "2.0", "util": "1.0"}
+    # 目标自身的变化计入 changes；保留当前版本的 util 不出现
+    assert body["changes"] == [
+        {"package": "lib", "from": "1.0", "to": "2.0"},
+    ]
+
+
+def test_upgrade_response_has_no_edges():
+    body = client.post("/upgrade", json=upgrade_body()).json()
+    assert "edges" not in body
+
+
+def test_upgrade_changes_sorted_by_package_name():
+    repo = {
+        "app": [{"version": "1.0",
+                 "dependencies": [{"name": "lib"}]}],
+        "lib": [{"version": "2.0", "dependencies": []},
+                {"version": "1.0", "dependencies": [{"name": "gone"}]}],
+        "gone": [{"version": "1.0"}],
+    }
+    lock = {"app": "1.0", "lib": "1.0", "gone": "1.0"}
+    r = client.post("/upgrade", json=upgrade_body(
+        repository=repo, current_lock=lock))
+    assert r.status_code == 200
+    names = [c["package"] for c in r.json()["changes"]]
+    assert names == sorted(names)
+    by = {c["package"]: c for c in r.json()["changes"]}
+    assert by["gone"] == {"package": "gone", "from": "1.0", "to": None}
+    assert by["lib"] == {"package": "lib", "from": "1.0", "to": "2.0"}
+    assert "gone" not in r.json()["locked"]
+
+
+def test_upgrade_addition_change_uses_null_from():
+    r = client.post("/upgrade", json=upgrade_body(
+        current_lock={"app": "1.0", "lib": "1.0"}))
+    by = {c["package"]: c for c in r.json()["changes"]}
+    assert by["util"] == {"package": "util", "from": None, "to": "1.0"}
+
+
+def test_upgrade_target_not_in_lock_422():
+    r = client.post("/upgrade", json=upgrade_body(target="absent"))
+    assert r.status_code == 422
+    body = r.json()
+    assert body["status"] == "invalid_snapshot"
+    assert "absent" in body["message"] and "current_lock" in body["message"]
+
+
+def test_upgrade_no_higher_version_409():
+    r = client.post("/upgrade", json=upgrade_body(target="app"))
+    assert r.status_code == 409
+    body = r.json()
+    assert body["status"] == "conflict"
+    assert body["conflicts"][0]["subject"] == "app"
+
+
+def test_upgrade_highest_feasible_target_version():
+    """3.0 因 util==9 不可行；必须回退选可行的最高版本 2.0。"""
+    repo = {
+        "app": [{"version": "1.0",
+                 "dependencies": [{"name": "lib"}]}],
+        "lib": [
+            {"version": "3.0",
+             "dependencies": [{"name": "util", "specifier": "==9"}]},
+            {"version": "2.0",
+             "dependencies": [{"name": "util"}]},
+            {"version": "1.0",
+             "dependencies": [{"name": "util"}]},
+        ],
+        "util": [{"version": "1.0"}],
+    }
+    r = client.post("/upgrade", json=upgrade_body(repository=repo))
+    assert r.status_code == 200
+    assert r.json()["target_version"] == "2.0"
+
+
+def test_upgrade_higher_versions_all_infeasible_409():
+    repo = {
+        "app": [{"version": "1.0",
+                 "dependencies": [{"name": "lib"}]}],
+        "lib": [
+            {"version": "2.0",
+             "dependencies": [{"name": "util", "specifier": "==9"}]},
+            {"version": "1.0",
+             "dependencies": [{"name": "util"}]},
+        ],
+        "util": [{"version": "1.0"}],
+    }
+    r = client.post("/upgrade", json=upgrade_body(repository=repo))
+    assert r.status_code == 409
+    assert r.json()["status"] == "conflict"
+
+
+def test_upgrade_minimizes_non_target_changes():
+    """无约束 util 可漂移到 3.0，但保留当前 1.0 可行时必须保留。"""
+    repo = {
+        "app": [{"version": "1.0",
+                 "dependencies": [{"name": "lib"}]}],
+        "lib": [
+            {"version": "2.0", "dependencies": [{"name": "util"}]},
+            {"version": "1.0", "dependencies": [{"name": "util"}]},
+        ],
+        "util": [{"version": "3.0"}, {"version": "1.0"}],
+    }
+    r = client.post("/upgrade", json=upgrade_body(repository=repo))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["locked"]["util"] == "1.0"
+    assert body["changes"] == [{"package": "lib", "from": "1.0", "to": "2.0"}]
+
+
+def test_upgrade_forced_transitive_drift_picks_highest():
+    """util 必须升级时，取最高可行版本（确定性降序）。"""
+    repo = {
+        "app": [{"version": "1.0",
+                 "dependencies": [{"name": "lib"}]}],
+        "lib": [
+            {"version": "2.0",
+             "dependencies": [{"name": "util", "specifier": ">=2"}]},
+            {"version": "1.0",
+             "dependencies": [{"name": "util"}]},
+        ],
+        "util": [{"version": "3.0"}, {"version": "2.0"}, {"version": "1.0"}],
+    }
+    r = client.post("/upgrade", json=upgrade_body(repository=repo))
+    assert r.status_code == 200
+    assert r.json()["locked"]["util"] == "3.0"
+
+
+def test_upgrade_root_as_target():
+    repo = {
+        "app": [{"version": "2.0", "dependencies": [{"name": "x"}]},
+                {"version": "1.0"}],
+        "x": [{"version": "1.0"}],
+    }
+    r = client.post("/upgrade", json=upgrade_body(
+        repository=repo,
+        current_lock={"app": "1.0"},
+        target="app",
+    ))
+    assert r.status_code == 200
+    body = r.json()
+    assert body["target_version"] == "2.0"
+    assert body["root_version"] == "2.0"
+    assert body["locked"] == {"app": "2.0", "x": "1.0"}
+
+
+def test_upgrade_target_name_normalized():
+    r = client.post("/upgrade", json=upgrade_body(target="LIB"))
+    assert r.status_code == 200
+    assert r.json()["target"] == "lib"
+
+
+def test_upgrade_prerelease_excluded_by_default():
+    repo = {
+        "app": [{"version": "1.0", "dependencies": [{"name": "lib"}]}],
+        "lib": [{"version": "2.0rc1"}, {"version": "1.9"}, {"version": "1.0"}],
+    }
+    r = client.post("/upgrade", json=upgrade_body(repository=repo))
+    assert r.status_code == 200
+    assert r.json()["target_version"] == "1.9"
+
+
+def test_upgrade_prerelease_allowed():
+    repo = {
+        "app": [{"version": "1.0", "dependencies": [{"name": "lib"}]}],
+        "lib": [{"version": "2.0rc1"}, {"version": "1.0"}],
+    }
+    r = client.post("/upgrade", json=upgrade_body(
+        repository=repo, allow_prereleases=True))
+    assert r.status_code == 200
+    assert r.json()["target_version"] == "2.0rc1"
+
+
+def test_upgrade_only_prerelease_higher_default_409():
+    repo = {
+        "app": [{"version": "1.0", "dependencies": [{"name": "lib"}]}],
+        "lib": [{"version": "2.0rc1"}, {"version": "1.0"}],
+    }
+    r = client.post("/upgrade", json=upgrade_body(repository=repo))
+    assert r.status_code == 409
+
+
+def test_upgrade_reuses_marker_semantics():
+    """同一快照：linux 不拉 win-only；win32 拉 win-only。"""
+    repo = {
+        "app": [{"version": "1.0", "dependencies": [{"name": "lib"}]}],
+        "lib": [
+            {"version": "2.0", "dependencies": [
+                {"name": "win-only", "marker": "sys_platform == 'win32'"}]},
+            {"version": "1.0"},
+        ],
+        "win-only": [{"version": "1.0"}],
+    }
+    r = client.post("/upgrade", json=upgrade_body(
+        repository=repo, current_lock={"app": "1.0", "lib": "1.0"}))
+    assert r.status_code == 200
+    assert r.json()["locked"] == {"app": "1.0", "lib": "2.0"}
+
+    win_env = {"python_version": "3.11", "sys_platform": "win32",
+               "platform_machine": "AMD64"}
+    r2 = client.post("/upgrade", json=upgrade_body(
+        repository=repo,
+        current_lock={"app": "1.0", "lib": "1.0"},
+        target_environment=win_env))
+    assert r2.status_code == 200
+    assert r2.json()["locked"] == {"app": "1.0", "lib": "2.0",
+                                   "win-only": "1.0"}
+
+
+def test_upgrade_bad_lock_version_422():
+    r = client.post("/upgrade", json=upgrade_body(
+        current_lock={"app": "1.0", "lib": "oops"}))
+    assert r.status_code == 422
+    assert "PEP 440" in r.json()["message"]
+
+
+def test_upgrade_duplicate_canonical_lock_key_422():
+    r = client.post("/upgrade", json=upgrade_body(
+        current_lock={"app": "1.0", "lib": "1.0", "LIB": "2.0"}))
+    assert r.status_code == 422
+    assert "lib" in r.json()["message"]
+
+
+def test_upgrade_empty_lock_422():
+    r = client.post("/upgrade", json=upgrade_body(current_lock={}))
+    assert r.status_code == 422
+
+
+def test_upgrade_unknown_root_422():
+    r = client.post("/upgrade", json=upgrade_body(root="missing"))
+    assert r.status_code == 422
+
+
+def test_upgrade_invalid_snapshot_422():
+    repo = {"app": [{"version": "nope", "dependencies": []}]}
+    r = client.post("/upgrade", json=upgrade_body(
+        repository=repo, current_lock={"app": "nope"}))
+    assert r.status_code == 422
+
+
+def test_upgrade_rejects_specifier_field_422():
+    r = client.post("/upgrade", json=upgrade_body(specifier=">=1"))
+    assert r.status_code == 422
+
+
+def test_upgrade_deterministic_regardless_of_input_order():
+    repo = {
+        "app": [{"version": "1.0", "dependencies": [{"name": "lib"}]}],
+        "lib": [
+            {"version": "2.0", "dependencies": [{"name": "zzz"}]},
+            {"version": "1.9", "dependencies": [{"name": "aaa"}]},
+            {"version": "1.0"},
+        ],
+        "zzz": [{"version": "1.0"}],
+        "aaa": [{"version": "1.0"}],
+    }
+    lock = {"app": "1.0", "lib": "1.0"}
+    first = client.post("/upgrade", json=upgrade_body(
+        repository=repo, current_lock=lock)).json()
+    shuffled = {k: list(reversed(v)) for k, v in repo.items()}
+    second = client.post("/upgrade", json=upgrade_body(
+        repository=shuffled, current_lock=lock)).json()
+    assert first == second

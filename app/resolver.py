@@ -226,13 +226,24 @@ class Resolver:
     # 入口
     # ------------------------------------------------------------------ #
     def resolve(
-        self, root_name: str, root_spec: SpecifierSet, root_raw: str
+        self,
+        root_name: str,
+        root_spec: SpecifierSet,
+        root_raw: str,
+        extra: list[Requirement] | None = None,
     ) -> State | None:
-        """成功返回最终 State；约束无解返回 None；超上限抛 ResolutionLimit。"""
+        """成功返回最终 State；约束无解返回 None；超上限抛 ResolutionLimit。
+
+        ``extra`` 为额外的根级需求（origin=None），由 /upgrade 注入用于钉死
+        或下界约束目标包；普通 /resolve 不传，行为不变。
+        """
         root_name = canonical(root_name)
         root_req = Requirement(root_name, root_spec, root_raw.strip() or "*", None, 0)
+        initial: list[Requirement] = [root_req]
+        if extra:
+            initial.extend(extra)
         state = State()
-        result = self._solve(state, [root_req], depth=0)
+        result = self._solve(state, initial, depth=0)
         if result is _LIMIT_SENTINEL:
             if self.max_depth > self.depth_limit:
                 raise ResolutionLimit(
